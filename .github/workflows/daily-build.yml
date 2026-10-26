@@ -1,0 +1,201 @@
+name: Daily build
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Emergency: deploy even if KV data is stale (repair regressions only)'
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [data-updated]
+  schedule:
+    # Backstop after the collector Worker's dense retry ladder (00:05-05:50 UTC).
+    - cron: '35 5 * * *'
+
+concurrency:
+  group: daily-build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      KV_NAMESPACE: ${{ secrets.KV_NAMESPACE }}
+      KV_TOKEN: ${{ secrets.KV_TOKEN }}
+      PAGES_PROJECT: ${{ secrets.PAGES_PROJECT }}
+      SITE_HOST: ${{ secrets.SITE_HOST }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Pull data and build code from Cloudflare KV
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p data scripts functions
+          BASE="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE/values"
+          for k in answers unlimited clueless artist_images play_pool song_previews; do
+            curl -sS --fail --max-time 90 \
+              -H "Authorization: Bearer $KV_TOKEN" \
+              "$BASE/data/$k" -o "data/$k.json"
+            python3 -m json.tool "data/$k.json" > /dev/null
+            echo "pulled data/$k.json ($(wc -c < "data/$k.json") bytes)"
+          done
+          for s in build_pages enrich_metadata fetch_artist_images; do
+            curl -sS --fail --max-time 90 \
+              -H "Authorization: Bearer $KV_TOKEN" \
+              "$BASE/code/$s" -o "scripts/$s.py"
+            echo "pulled scripts/$s.py ($(wc -c < "scripts/$s.py") bytes)"
+          done
+          # Edge middleware (bot classification, AE analytics writes, sitemap 301).
+          # wrangler reads Functions from the WORKSPACE-ROOT functions/ dir, not
+          # the deploy dir (proven 2026-10-25). --fail: never deploy without it.
+          curl -sS --fail --max-time 60 \
+            -H "Authorization: Bearer $KV_TOKEN" \
+            "$BASE/code/middleware" -o functions/_middleware.js
+          echo "pulled functions/_middleware.js ($(wc -c < functions/_middleware.js) bytes)"
+
+      - name: Enrich metadata (public iTunes API)
+        run: python3 scripts/enrich_metadata.py
+
+      - name: Fetch artist images (public Deezer API, new artists only)
+        run: python3 scripts/fetch_artist_images.py
+        env:
+          DEEZER_PROXY: ''
+
+      - name: Build pages
+        run: python3 scripts/build_pages.py
+
+      # 2026-10-26 P0 fix: the public chain only used to deploy generated files,
+      # so every static root file (robots/llms/404/favicon set/assets/og-default/
+      # play game.js/IndexNow keys) silently vanished and CF Pages' SPA fallback
+      # served "200 + homepage HTML" for all of them. The static bundle is now the
+      # single source of truth (repo static/ -> KV code/static) and this step is
+      # fail-closed: no bundle = no deploy.
+      - name: Pull static bundle from KV (fail-closed)
+        run: |
+          BASE="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE/values"
+          curl -sS --fail --max-time 90 -H "Authorization: Bearer $KV_TOKEN" \
+            "$BASE/code/static" -o static.tar.gz
+          ls -l static.tar.gz
+          tar -tzf static.tar.gz > /dev/null
+          tar -xzf static.tar.gz -C site
+          missing=0
+          for f in robots.txt llms.txt 404.html favicon.ico \
+                   assets/og-default.png assets/apple-touch-icon.png \
+                   assets/favicon.svg play/game.js; do
+            if [ ! -s "site/$f" ]; then echo "MISSING STATIC FILE: site/$f"; missing=1; fi
+          done
+          KEY=$(cd site && ls | grep -E '^[a-f0-9]{32}\.txt$' | head -1 || true)
+          if [ -z "$KEY" ]; then echo "MISSING: IndexNow key file"; missing=1; fi
+          [ "$missing" -eq 0 ] || { echo "STATIC BUNDLE BROKEN -> refusing to deploy"; exit 1; }
+          echo "static bundle OK ($(find site/assets -type f | wc -l) asset files, key=$KEY)"
+
+      - name: Data freshness gate (block stale deploys)
+        run: |
+          # A stale KV snapshot must never reach production: deploying it would
+          # roll the live site back to yesterday (happened once on 2026-10-24).
+          # `force` is an emergency repair escape hatch (repair regressions while
+          # data is stale, e.g. after an architecture incident) — not for daily use.
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            echo "FORCE MODE: freshness gate skipped (emergency repair run)"
+            exit 0
+          fi
+          EXPECT=$(date -u +%Y-%m-%d)
+          if [ "$(date -u +%H)" -lt 4 ]; then
+            EXPECT=$(date -u -d "yesterday" +%Y-%m-%d)
+          fi
+          LATEST=$(jq -r '[.answers[].date] | max' data/answers.json)
+          echo "Freshness gate: latest answer = $LATEST, required >= $EXPECT"
+          if [ "$LATEST" \< "$EXPECT" ]; then
+            echo "STALE DATA - refusing to deploy (would roll back the live site)"
+            exit 1
+          fi
+
+      - name: Push enriched data back to KV
+        run: |
+          BASE="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE/values"
+          for k in answers artist_images song_previews unlimited; do
+            curl -sS --fail --max-time 90 -X PUT \
+              -H "Authorization: Bearer $KV_TOKEN" \
+              "$BASE/data/$k" \
+              --data-binary "@data/$k.json"
+            echo "pushed data/$k"
+          done
+
+      - name: Deploy to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PAGES_TOKEN }}
+        run: npx -y wrangler pages deploy site --project-name "$PAGES_PROJECT" --branch main --commit-dirty=true
+
+      - name: IndexNow ping
+        run: |
+          KEY_FILE=$(cd site && ls | grep -E '^[a-f0-9]{32}\.txt$' | head -1 || true)
+          if [ -z "$KEY_FILE" ]; then echo "no IndexNow key file found in build output"; exit 1; fi
+          KEY="${KEY_FILE%.txt}"
+          DAY=$(jq -r '[.answers[].date] | max' data/answers.json)
+          EXTRA=""
+          if [ -f site/songless-answer-today.html ]; then EXTRA=",\"https://$SITE_HOST/songless-answer-today\""; fi
+          URLS="[\"https://$SITE_HOST/\",\"https://$SITE_HOST/hints\",\"https://$SITE_HOST/archive\",\"https://$SITE_HOST/play/\",\"https://$SITE_HOST/songs/\",\"https://$SITE_HOST/artists\",\"https://$SITE_HOST/$DAY/\"$EXTRA]"
+          CODE=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 60 -X POST https://api.indexnow.org/indexnow \
+            -H "Content-Type: application/json" \
+            --data "{\"host\":\"$SITE_HOST\",\"key\":\"$KEY\",\"keyLocation\":\"https://$SITE_HOST/$KEY_FILE\",\"urlList\":$URLS}" || true)
+          echo "IndexNow ping day=$DAY http=$CODE"
+          case "$CODE" in 200|202) echo "IndexNow accepted" ;; *) echo "IndexNow warning: HTTP $CODE (non-fatal)" ;; esac
+
+      - name: Verify live site (data + static assets)
+        run: |
+          sleep 15
+          # Data freshness check (puzzle resets 04:00 UTC = midnight Eastern).
+          HOUR=$(date -u +%H)
+          EXPECT=$(date -u +%Y-%m-%d)
+          if [ "$HOUR" -lt 4 ] && [ "${{ github.event.inputs.force }}" != "true" ]; then
+            EXPECT=$(date -u -d "yesterday" +%Y-%m-%d)
+          fi
+          fail=0
+          LIVE=$(curl -s --max-time 30 -H "Cache-Control: no-cache" "https://$SITE_HOST/api/today.json?cb=$(date +%s)" | jq -r '.date // empty')
+          echo "Expected date: $EXPECT | Live: $LIVE"
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            if [ -z "$LIVE" ]; then echo "api/today.json unreachable"; fail=1; fi
+          elif [ "$LIVE" != "$EXPECT" ]; then
+            echo "VERIFICATION FAILED: live site shows $LIVE, expected $EXPECT"; fail=1
+          fi
+          CB=$(date +%s)
+          ROBOTS_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Cache-Control: no-cache" "https://$SITE_HOST/robots.txt?cb=$CB")
+          ROBOTS_TYPE=$(curl -s -o /dev/null -w "%{content_type}" -H "Cache-Control: no-cache" "https://$SITE_HOST/robots.txt?cb=$CB")
+          ROBOTS_HAS_SITEMAP=$(curl -s -H "Cache-Control: no-cache" "https://$SITE_HOST/robots.txt?cb=$CB" | grep -c "Sitemap: https://$SITE_HOST/sitemap-index.xml" || true)
+          echo "robots.txt: $ROBOTS_CODE $ROBOTS_TYPE sitemap_line=$ROBOTS_HAS_SITEMAP"
+          [ "$ROBOTS_CODE" = "200" ] && echo "$ROBOTS_TYPE" | grep -q "text/plain" || { echo "robots.txt broken"; fail=1; }
+          [ "$ROBOTS_HAS_SITEMAP" -ge 1 ] || { echo "robots.txt missing Sitemap directive"; fail=1; }
+          ICON_TYPE=$(curl -s -o /dev/null -w "%{content_type}" -H "Cache-Control: no-cache" "https://$SITE_HOST/assets/apple-touch-icon.png?cb=$CB")
+          echo "apple-touch-icon: $ICON_TYPE"
+          echo "$ICON_TYPE" | grep -q "image/png" || { echo "apple-touch-icon broken"; fail=1; }
+          OG_TYPE=$(curl -s -o /dev/null -w "%{content_type}" -H "Cache-Control: no-cache" "https://$SITE_HOST/assets/og-default.png?cb=$CB")
+          echo "og-default: $OG_TYPE"
+          echo "$OG_TYPE" | grep -q "image/png" || { echo "og-default broken"; fail=1; }
+          JS_TYPE=$(curl -s -o /dev/null -w "%{content_type}" -H "Cache-Control: no-cache" "https://$SITE_HOST/play/game.js?cb=$CB")
+          echo "play/game.js: $JS_TYPE"
+          echo "$JS_TYPE" | grep -qi "javascript" || { echo "play/game.js broken"; fail=1; }
+          NF=$(curl -s -o /dev/null -w "%{http_code}" -H "Cache-Control: no-cache" "https://$SITE_HOST/this-page-does-not-exist-$CB")
+          echo "unknown path status: $NF"
+          [ "$NF" = "404" ] || { echo "404 handling broken"; fail=1; }
+          [ "$fail" -eq 0 ] || { echo "LIVE VERIFICATION FAILED"; exit 1; }
+          echo "Live site verified: data=$LIVE, static assets OK, 404 OK"
+
+      - name: Build summary
+        if: always()
+        run: |
+          {
+            echo "## Build report"
+            echo "- Finished: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "- Live today: $(curl -s --max-time 15 "https://$SITE_HOST/api/today.json" | jq -r '.data // .date // "unreachable"')"
+            echo "- Pages built: $(find site -name '*.html' | wc -l)"
+            echo "- Static files: $(find site/assets -type f | wc -l) assets + root files"
+          } >> "$GITHUB_STEP_SUMMARY"
