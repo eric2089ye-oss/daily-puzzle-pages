@@ -98,7 +98,7 @@ jobs:
           python3 -c 'import sys; raise SystemExit("STALE DATA: refusing to deploy" if sys.argv[1] < sys.argv[2] else 0)' "$LATEST" "$EXPECT"
 
       - name: Push enriched data back to KV (deploy only)
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run != 'true' && github.event.inputs.dry_run != true }}
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run != 'true' && github.event.inputs.dry_run != true }}
         run: |
           BASE="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE/values"
           for k in answers artist_images song_previews unlimited; do
