@@ -1,0 +1,130 @@
+name: Daily build (versioned UI release)
+
+on:
+  # Manual-only while the new UI is in shadow. Re-add schedule/repository_dispatch
+  # only after dry-run + two shadow days + rollback drill succeed.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and verify only; do not deploy'
+        type: boolean
+        default: true
+      force:
+        description: 'Emergency: skip freshness gate (repair only)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: daily-build-ui
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      KV_NAMESPACE: ${{ secrets.KV_NAMESPACE }}
+      KV_TOKEN: ${{ secrets.KV_TOKEN }}
+      PAGES_PROJECT: ${{ secrets.PAGES_PROJECT }}
+      SITE_HOST: ${{ secrets.SITE_HOST }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Pull data and active UI release manifest
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p data scripts functions
+          BASE="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE/values"
+          for k in answers unlimited clueless artist_images play_pool song_previews; do
+            curl -sS --fail --max-time 90 -H "Authorization: Bearer $KV_TOKEN" \
+              "$BASE/data/$k" -o "data/$k.json"
+            python3 -m json.tool "data/$k.json" > /dev/null
+            echo "pulled data/$k.json"
+          done
+          curl -sS --fail --max-time 90 -H "Authorization: Bearer $KV_TOKEN" \
+            "$BASE/code/ui-active-manifest" -o release-manifest.json
+          python3 -m json.tool release-manifest.json > /dev/null
+          REL=$(python3 -c 'import json;print(json.load(open("release-manifest.json"))["releaseId"])')
+          KEY=$(python3 -c 'import json;print(json.load(open("release-manifest.json"))["bundleKey"])')
+          SHA=$(python3 -c 'import json;print(json.load(open("release-manifest.json"))["bundleSha256"])')
+          curl -sS --fail --max-time 180 -H "Authorization: Bearer $KV_TOKEN" \
+            "$BASE/$KEY" -o ui-release.tar.gz
+          echo "$SHA  ui-release.tar.gz" | sha256sum -c -
+          tar -xzf ui-release.tar.gz
+          test -s scripts/build_pages.py
+          test -s scripts/templates/new_ui_home_answer.html
+          test -s static/assets/app.js
+          test -s functions/_middleware.js
+          echo "release=$REL"
+
+      - name: Refresh current previews
+        run: python3 scripts/lookup_current_previews.py
+
+      - name: Enrich metadata (public iTunes API)
+        run: python3 scripts/enrich_metadata.py
+
+      - name: Fetch artist images (public Deezer API, new artists only)
+        run: python3 scripts/fetch_artist_images.py
+        env:
+          DEEZER_PROXY: ''
+
+      - name: Build stage
+        run: python3 scripts/build_pages.py --site site-stage
+
+      - name: Prepare production candidate and verify release gates
+        run: |
+          python3 scripts/prepare_live.py site-stage site-live
+          python3 scripts/verify_release.py --site site-live
+
+      - name: Data freshness gate
+        run: |
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then exit 0; fi
+          EXPECT=$(date -u +%Y-%m-%d)
+          if [ "$(date -u +%H)" -lt 4 ]; then EXPECT=$(date -u -d "yesterday" +%Y-%m-%d); fi
+          LATEST=$(jq -r '[.answers[].date] | max' data/answers.json)
+          echo "latest=$LATEST required>=$EXPECT"
+          python3 -c 'import sys; raise SystemExit("STALE DATA: refusing to deploy" if sys.argv[1] < sys.argv[2] else 0)' "$LATEST" "$EXPECT"
+
+      - name: Push enriched data back to KV
+        run: |
+          BASE="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE/values"
+          for k in answers artist_images song_previews unlimited; do
+            curl -sS --fail --max-time 90 -X PUT -H "Authorization: Bearer $KV_TOKEN" \
+              "$BASE/data/$k" --data-binary "@data/$k.json"
+          done
+
+      - name: Deploy production candidate
+        if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.dry_run != true }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.PAGES_TOKEN }}
+        run: npx -y wrangler pages deploy site-live --project-name "$PAGES_PROJECT" --branch main --commit-dirty=true
+
+      - name: IndexNow ping (deploy only)
+        if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.dry_run != true }}
+        run: |
+          KEY_FILE=$(cd site-live && ls | grep -E '^[a-f0-9]{32}\.txt$' | head -1 || true)
+          [ -n "$KEY_FILE" ] || exit 1
+          KEY="${KEY_FILE%.txt}"
+          DAY=$(jq -r '[.answers[].date] | max' data/answers.json)
+          curl -sS --max-time 60 -X POST https://api.indexnow.org/indexnow \
+            -H "Content-Type: application/json" \
+            --data "{\"host\":\"$SITE_HOST\",\"key\":\"$KEY\",\"keyLocation\":\"https://$SITE_HOST/$KEY_FILE\",\"urlList\":[\"https://$SITE_HOST/\",\"https://$SITE_HOST/$DAY/\"]}"
+
+      - name: Verify live site (deploy only)
+        if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.dry_run != true }}
+        run: |
+          sleep 15
+          CB=$(date +%s)
+          LIVE=$(curl -s --max-time 30 -H "Cache-Control: no-cache" "https://$SITE_HOST/api/today.json?cb=$CB" | jq -r '.date // empty')
+          DAY=$(jq -r '[.answers[].date] | max' data/answers.json)
+          [ "$LIVE" = "$DAY" ] || exit 1
+          NF=$(curl -s -o /dev/null -w "%{http_code}" "https://$SITE_HOST/this-page-does-not-exist-$CB")
+          [ "$NF" = "404" ] || exit 1
+          echo "live verified $LIVE"
