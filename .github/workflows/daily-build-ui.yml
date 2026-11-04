@@ -98,7 +98,7 @@ jobs:
           python3 -c 'import sys; raise SystemExit("STALE DATA: refusing to deploy" if sys.argv[1] < sys.argv[2] else 0)' "$LATEST" "$EXPECT"
 
       - name: Push enriched data back to KV (deploy only)
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run != 'true' && github.event.inputs.dry_run != true }}
+        if: ${{ (github.event_name != 'workflow_dispatch' || (github.event.inputs.dry_run != 'true' && github.event.inputs.dry_run != true)) }}
         run: |
           BASE="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces/$KV_NAMESPACE/values"
           for k in answers artist_images song_previews unlimited; do
@@ -107,13 +107,13 @@ jobs:
           done
 
       - name: Deploy production candidate
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run != 'true' && github.event.inputs.dry_run != true }}
+        if: ${{ (github.event_name != 'workflow_dispatch' || (github.event.inputs.dry_run != 'true' && github.event.inputs.dry_run != true)) }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.PAGES_TOKEN }}
         run: npx -y wrangler pages deploy site-live --project-name "$PAGES_PROJECT" --branch main --commit-dirty=true
 
       - name: IndexNow ping (deploy only)
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run != 'true' && github.event.inputs.dry_run != true }}
+        if: ${{ (github.event_name != 'workflow_dispatch' || (github.event.inputs.dry_run != 'true' && github.event.inputs.dry_run != true)) }}
         run: |
           KEY_FILE=$(cd site-live && ls | grep -E '^[a-f0-9]{32}\.txt$' | head -1 || true)
           [ -n "$KEY_FILE" ] || exit 1
@@ -124,7 +124,7 @@ jobs:
             --data "{\"host\":\"$SITE_HOST\",\"key\":\"$KEY\",\"keyLocation\":\"https://$SITE_HOST/$KEY_FILE\",\"urlList\":[\"https://$SITE_HOST/\",\"https://$SITE_HOST/$DAY/\"]}"
 
       - name: Verify live site (deploy only)
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run != 'true' && github.event.inputs.dry_run != true }}
+        if: ${{ (github.event_name != 'workflow_dispatch' || (github.event.inputs.dry_run != 'true' && github.event.inputs.dry_run != true)) }}
         run: |
           sleep 15
           CB=$(date +%s)
